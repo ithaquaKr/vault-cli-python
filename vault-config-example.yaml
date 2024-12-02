@@ -3,12 +3,11 @@ setting:
   url: "http://127.0.0.1:8200"
   username: "admin"
   password: "password"
-  token: "hvs.9XnKjWxU2LgSXkFWCeFXj7kS"
+  token: ""
   key_shares: 5
   threshold: 3
   instance_name: "vault"
   namespace: "vault"
-  base_path: "/"
 
 # Allows creating policies in Vault which can be used later on in roles
 # for the Kubernetes based authentication.
@@ -125,15 +124,6 @@ auth:
   # NOTE: Can not disable authentication token, this is enable by default
   - type: token
     path: token/
-    # method_config:
-    #   roles:
-    #     - name: prometheus-metrics
-    #       allowed_policies:
-    #         - prometheus-metrics
-    #       disallowed_policies:
-    #         - Administrator
-    #         - DeveloperFullAccess
-    #       orphan: true
 
   # The userpass auth method allows authentication against Vault using Vault username/password credentials.
   # See https://www.vaultproject.io/docs/auth/userpass.html for more information.
@@ -152,31 +142,50 @@ auth:
             - default
             - viewer
 
-# # Allows configuring Secrets Engines in Vault (KV, Database and SSH is tested,
-# # but the config is free form so probably more is supported).
-# # See https://www.vaultproject.io/docs/secrets/index.html for more information.
+# Allows configuring Secrets Engines in Vault (KV, Database and SSH is tested,
+# but the config is free form so probably more is supported).
+# See https://www.vaultproject.io/docs/secrets/index.html for more information.
 
 # NOTE: CLI Tools only support kv-v2 storage engines in this time.
 secret_engines:
   # This plugin stores arbitrary secrets within the configured physical storage for Vault.
   # See https://www.vaultproject.io/docs/secrets/kv/index.html for
   # more information.
-  - path: secret/
+  - path: local/
     type: kv
     description: General secrets.
-
-  # Mounts kv with extra configuration
   - path: leaderelection/
+    type: kv
+    description: kv secret engine used for leader election logic
+  - path: secret/local/
     type: kv
     description: kv secret engine used for leader election logic
 # Allows writing some secrets to Vault (useful for development purposes).
 # See https://www.vaultproject.io/docs/secrets/kv/index.html for more information.
-# startupSecrets:
-#   - type: kv
-#     path: secret/data/accounts/aws
-#     data:
-#       data:
-#         AWS_ACCESS_KEY_ID: secretId
-#         AWS_SECRET_ACCESS_KEY: s3cr3t
 #
-
+# Mount point must exist in secrets engines configurations
+startup_secrets:
+  - path: backend/flask
+    mount_point: secret/local/
+    type: kv
+    data:
+      AWS_ACCESS_KEY_ID: secretId
+      AWS_SECRET_ACCESS_KEY: s3cr3t
+  - path: client
+    mount_point: secret/local/
+    type: kv
+    data:
+      CLIENT_KEY: secretId
+      CLIENT_SECRET: thisissecret
+  - path: database
+    mount_point: local/
+    type: kv
+    data:
+      DATABASE_USER: user
+      DATABASE_PASSWORD: password
+  - path: cache
+    mount_point: local/
+    type: kv
+    data:
+      CACHE_DB_USER: user
+      CACHE_DB_PASSWORD: password

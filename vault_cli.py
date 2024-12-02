@@ -144,7 +144,6 @@ class Setting(BaseModel):
         threshold: Number of keys required to unseal Vault.
         instance_list: List of Vault instance name.
         namespace: Kubernetes namespace where Vault is installed.
-        base_path: Base path of Vault.
         username: Username to access Vault.
         password: Password to access Vault.
         token: Token to access Vault.
@@ -157,7 +156,6 @@ class Setting(BaseModel):
     threshold: int = 3
     instance_list: List[str] = ["vault-0", "vault-1", "vault-2"]
     namespace: str = "vault"
-    base_path: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     token: Optional[str] = None
@@ -263,8 +261,11 @@ class VaultKVSecretEngine(BaseModel):
     type: str
 
 
-class StartupSecret:
-    pass
+class StartupSecret(BaseModel):
+    path: str
+    mount_point: str
+    type: str
+    data: Dict
 
 
 class Configuration(BaseModel):
@@ -272,6 +273,7 @@ class Configuration(BaseModel):
     policies: List[VaultPolicy]
     auth: List[VaultAuthMethod]
     secret_engines: List[VaultKVSecretEngine]
+    startup_secrets: List[StartupSecret]
 
 
 def load_config_file(config_path: str) -> Configuration:
@@ -589,6 +591,59 @@ class VaultClient:
     # def secrets_engines_tune_configs(self) -> JSONDict:
     #     return {}
 
+    def _browse_recursive_secrets(self, path: str, mount_point: str) -> Iterable[str]:
+        """
+        Given a secret or folder path, return the path of all secrets
+        under it (or the path itself)
+        """
+        # 4 things can happen:
+        # - path is "", it's the root (and a folder)
+        # - path ends with /, we know it's a folder
+        # - path doesn't end with a / and yet it's a folder
+        # - path is a secret
+        folder = path.endswith("/") or path == ""
+
+        sub_secrets = self.kvv2_secrets_list(path=path, mount_point=mount_point)
+
+        if not folder and not sub_secrets:
+            # It's most probably a secret
+            yield path
+
+        for key in sub_secrets:
+            folder = key.endswith("/")
+            key = key.rstrip("/")
+            key_url = f"{path}/{key}" if path else key
+            if not folder:
+                yield key_url
+                continue
+
+            for sub_path in self._browse_recursive_secrets(key_url, mount_point):
+                yield sub_path
+
+    @handle_client_errors()
+    def kvv2_secrets_list(self, path: str, mount_point: str) -> List:
+        return (
+            self.client.secrets.kv.v2.list_secrets(path=path, mount_point=mount_point)[
+                "data"
+            ]["keys"]
+            or []
+        )
+
+    @handle_client_errors()
+    def kvv2_secrets_read(self, path: str, mount_point: str) -> JSONDict:
+        return (
+            self.client.secrets.kv.v2.read_secret(path=path, mount_point=mount_point)[
+                "data"
+            ]
+            or {}
+        )
+
+    @handle_client_errors()
+    def kvv2_secrets_create_or_update(self, path: str, secret: Dict, mount_point: str):
+        return self.client.secrets.kv.v2.create_or_update_secret(
+            path=path, secret=secret, mount_point=mount_point
+        )
+
 
 #################
 #### Command ####
@@ -763,7 +818,7 @@ class Commands:
             # Get Authentication methods from Vault
             vault_authmethods = [
                 {"path": path, "type": details["type"]}
-                for path, details in self.client.auth_methods_list().items()
+                for path, details in self.client.auth_methods_list().items()  # BUG: Fail when empty auth method list
                 if isinstance(details, dict) and "type" in details
             ]
 
@@ -1059,11 +1114,19 @@ class Commands:
 
         return errors
 
-    def sync_secrets(self):
-        pass
+    def sync_secrets(self, startup_secrets: List, remove_orphans: bool = False) -> List:
+        errors = []
+        try:
+            for secret in startup_secrets:
+                self.client.kvv2_secrets_create_or_update(
+                    path=secret.path, mount_point=secret.mount_point, secret=secret.data
+                )
 
+        except Exception as exc:
+            errors.append(f"An unexpected error occurred: {exc}")
 
-# commands = Commands()
+        return errors
+
 
 CONTEXT_SETTINGS = {
     "help_option_names": ["-h", "--help"],
@@ -1184,14 +1247,38 @@ def sync_configs(ctx: CLIContext, remove_orphans: bool):
         ctx.cfg.secret_engines, remove_orphans
     )
 
-    for err in errors:
-        click.echo(err)
+    if errors:
+        for err in errors:
+            click.echo(err)
+    else:
+        click.echo("All configurations is synced. Feel happy. ^^")
 
 
 @cli.command()
 @click.pass_obj
-def sync_secrets(client_obj):
-    pass
+@click.option(
+    "--remove_orphans",
+    "-ro",
+    help="Remove orphans data",
+    is_flag=True,
+    default=False,
+    show_default=True,
+)
+def sync_secrets(ctx: CLIContext, remove_orphans: bool):
+    # Client Authentication
+    ctx.client.auth(
+        token=ctx.cfg.setting.token,
+        username=ctx.cfg.setting.username,
+        password=ctx.cfg.setting.password,
+    )
+    commands = Commands(ctx.client)
+    errors = commands.sync_secrets(ctx.cfg.startup_secrets, remove_orphans)
+
+    if errors:
+        for err in errors:
+            click.echo(err)
+    else:
+        click.echo("Secrets is synced. Feel happy ^^!")
 
 
 ##############
