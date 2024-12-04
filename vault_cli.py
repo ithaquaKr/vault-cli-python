@@ -12,13 +12,6 @@ from kubernetes import client, config
 from kubernetes.stream import stream
 from pydantic import BaseModel
 
-# from rich.progress import (
-#     Progress,
-#     SpinnerColumn,
-#     TextColumn,
-# )
-
-
 ################
 #### Typing ####
 ################
@@ -132,23 +125,7 @@ def get_obj_by_key_value_from_list(
 ########################
 
 
-class Setting(BaseModel):
-    """Base configurations use by cli tool to do it job
-
-    Attributes:
-        config_path: Path to the configuration file.
-        output_path: Path to the file where content like root token and unseal key from the initialization step is saved.
-        url (str): URL of the Vault instance.
-        url: URL of the Vault instance.
-        key_shares: Number of keys that Vault will create during the initialization step.
-        threshold: Number of keys required to unseal Vault.
-        instance_list: List of Vault instance name.
-        namespace: Kubernetes namespace where Vault is installed.
-        username: Username to access Vault.
-        password: Password to access Vault.
-        token: Token to access Vault.
-    """
-
+class DEFAULT_SETTINGS:
     config_path: str = "./vault-config.yaml"
     output_path: str = "./output.json"
     url: str = "http://127.0.0.1:8200/"
@@ -156,12 +133,6 @@ class Setting(BaseModel):
     threshold: int = 3
     instance_list: List[str] = ["vault-0", "vault-1", "vault-2"]
     namespace: str = "vault"
-    username: Optional[str] = None
-    password: Optional[str] = None
-    token: Optional[str] = None
-
-
-DEFAULT_SETTINGS = Setting()
 
 
 class VaultPolicy(BaseModel):
@@ -269,7 +240,6 @@ class StartupSecret(BaseModel):
 
 
 class Configuration(BaseModel):
-    setting: Setting
     policies: List[VaultPolicy]
     auth: List[VaultAuthMethod]
     secret_engines: List[VaultKVSecretEngine]
@@ -391,9 +361,14 @@ class VaultClient:
         return self.client.sys.is_sealed()
 
     @handle_client_errors()
-    def health_status(self):
+    def health_status(self) -> JSONDict:
         """Read the health status of Vault."""
         return self.client.sys.read_health_status(method="GET")
+
+    @handle_client_errors()
+    def seal_status(self) -> Dict:
+        """Read the seal status of the Vault."""
+        return self.client.sys.read_seal_status()
 
     @handle_client_errors()
     def initialize(self, shares: int, threshold: int) -> JSONDict:
@@ -1172,7 +1147,55 @@ def cli(ctx: click.Context, config_path: str, **kwargs) -> None:
 
 
 @cli.command()
-def bootstrap() -> None:
+@click.pass_obj
+@click.option(
+    "--url",
+    "-u",
+    default=DEFAULT_SETTINGS.url,
+    show_default=True,
+    help="URL of the Vault instance.",
+)
+@click.option(
+    "--output_path",
+    "-o",
+    default=DEFAULT_SETTINGS.output_path,
+    show_default=True,
+    help="Path to the file where content like root token and unseal key from the initialization step is saved.",
+)
+@click.option(
+    "--key_shares",
+    "-n",
+    default=DEFAULT_SETTINGS.key_shares,
+    help="Number of keys that Vault will create during the initialization step.",
+)
+@click.option(
+    "--threshold",
+    "-t",
+    default=DEFAULT_SETTINGS.threshold,
+    help="Number of keys required to unseal Vault.",
+)
+@click.option(
+    "--instance_list",
+    help="List of Vault instance name that used to unseal.",
+    multiple=True,
+    default=DEFAULT_SETTINGS.instance_list,
+    show_default=True,
+)
+@click.option(
+    "--namespace",
+    default=DEFAULT_SETTINGS.namespace,
+    show_default=True,
+    help="Kubernetes namespace that install Vault.",
+)
+def bootstrap(
+    ctx: CLIContext,
+    url: str,
+    output_path: str,
+    key_shares: int,
+    threshold: int,
+    instance_list: Tuple,
+    namespace: str,
+) -> None:
     """
     Bootstrap the target Vault cluster
 
@@ -1183,6 +1206,12 @@ def bootstrap() -> None:
     """
     # Create raw Vault client
     # client = VaultClient(url=url)
+    commands = Commands(ctx.client)
+    commands.create_vault(
+        output_path=output_path,
+        key_shares=key_shares,
+        threshold=threshold,
+    )
 
     # Check Vault connection
     # client.init_status()
@@ -1207,18 +1236,73 @@ def bootstrap() -> None:
 
 @cli.command()
 @click.pass_obj
-def unseal(client_obj: VaultClient) -> None:
+@click.option(
+    "--instance_list",
+    help="List of Vault instance name that used to unseal.",
+    multiple=True,
+    default=DEFAULT_SETTINGS.instance_list,
+    show_default=True,
+)
+@click.option(
+    "--namespace",
+    default=DEFAULT_SETTINGS.namespace,
+    show_default=True,
+    help="Kubernetes namespace that install Vault.",
+)
+def unseal(ctx: CLIContext, instance_list: Tuple, namespace: str) -> None:
     """
     Unseals Vault with unseal keys provide from command line.
 
     It will continuously attempt to unseal the target Vault instance, by retrieving unseal keys
     from command line.
     """
-    click.echo("Done")
+    # Check seal status
+    status = ctx.client.seal_status()
+    if not status.get("sealed"):
+        click.echo("Your Vault is not sealed.")
+        return
+    # Get threshold of Vault
+    threshold = int(status.get("t", 0))
+    keys: List[str] = []
+    for i in range(threshold):
+        key = click.prompt(f"Enter the unseal key {i}: ", type=str)
+        keys.append(key)
+
+    commands = Commands(ctx.client)
+    commands.unseal_all(
+        keys=keys, namespace=namespace, instance_list=list(instance_list)
+    )
+
+    click.echo("Unseal progress done. Let's take a coffee. :3")
 
 
 @cli.command()
 @click.pass_obj
+@click.option(
+    "--token",
+    prompt=True,
+    hide_input=True,
+    prompt_required=False,
+    envvar="VAULT_CLI_TOKEN",
+    help="Token to connect to Vault.",
+)
+@click.option(
+    "--username",
+    "-u",
+    prompt=True,
+    prompt_required=False,
+    envvar="VAULT_CLI_USERNAME",
+    help="Username used for userpass authentication.",
+)
+@click.option(
+    "--password",
+    "-w",
+    prompt=True,
+    hide_input=True,
+    prompt_required=False,
+    envvar="VAULT_CLI_PASSWORD",
+    help="Password used for userpass authentication.",
+)
 @click.option(
     "--remove_orphans",
     "-ro",
@@ -1227,7 +1311,9 @@ def unseal(client_obj: VaultClient) -> None:
     default=False,
     show_default=True,
 )
-def sync_configs(ctx: CLIContext, remove_orphans: bool):
+def sync_configs(
+    ctx: CLIContext, token: str, username: str, password: str, remove_orphans: bool
+):
     """Synchronizes configurations from a file to Vault.
 
     Reads configuration data from the file specified by `CONFIG_FILE_PATH` (an environment variable or configuration setting),
@@ -1235,9 +1321,9 @@ def sync_configs(ctx: CLIContext, remove_orphans: bool):
     """
     # Client Authentication
     ctx.client.auth(
-        token=ctx.cfg.setting.token,
-        username=ctx.cfg.setting.username,
-        password=ctx.cfg.setting.password,
+        token=token,
+        username=username,
+        password=password,
     )
     errors = []
     commands = Commands(ctx.client)
@@ -1257,6 +1343,31 @@ def sync_configs(ctx: CLIContext, remove_orphans: bool):
 @cli.command()
 @click.pass_obj
 @click.option(
+    "--token",
+    prompt=True,
+    hide_input=True,
+    prompt_required=False,
+    envvar="VAULT_CLI_TOKEN",
+    help="Token to connect to Vault.",
+)
+@click.option(
+    "--username",
+    "-u",
+    prompt=True,
+    prompt_required=False,
+    envvar="VAULT_CLI_USERNAME",
+    help="Username used for userpass authentication.",
+)
+@click.option(
+    "--password",
+    "-w",
+    prompt=True,
+    hide_input=True,
+    prompt_required=False,
+    envvar="VAULT_CLI_PASSWORD",
+    help="Password used for userpass authentication.",
+)
+@click.option(
     "--remove_orphans",
     "-ro",
     help="Remove orphans data",
@@ -1264,12 +1375,19 @@ def sync_configs(ctx: CLIContext, remove_orphans: bool):
     default=False,
     show_default=True,
 )
-def sync_secrets(ctx: CLIContext, remove_orphans: bool):
+def sync_secrets(
+    ctx: CLIContext, token: str, username: str, password: str, remove_orphans: bool
+):
+    """Synchronizes secrets from a file to Vault.
+
+    Reads secrets data from the file specified by `CONFIG_FILE_PATH` (an environment variable or configuration setting),
+    and pushes this data to the Vault server.
+    """
     # Client Authentication
     ctx.client.auth(
-        token=ctx.cfg.setting.token,
-        username=ctx.cfg.setting.username,
-        password=ctx.cfg.setting.password,
+        token=token,
+        username=username,
+        password=password,
     )
     commands = Commands(ctx.client)
     errors = commands.sync_secrets(ctx.cfg.startup_secrets, remove_orphans)

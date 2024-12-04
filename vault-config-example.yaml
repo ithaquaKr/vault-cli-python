@@ -1,14 +1,3 @@
-setting:
-  # URL of Vault instance
-  url: "http://127.0.0.1:8200"
-  username: "admin"
-  password: "password"
-  token: ""
-  key_shares: 5
-  threshold: 3
-  instance_name: "vault"
-  namespace: "vault"
-
 # Allows creating policies in Vault which can be used later on in roles
 # for the Kubernetes based authentication.
 # See https://www.vaultproject.io/docs/concepts/policies.html for more information.
