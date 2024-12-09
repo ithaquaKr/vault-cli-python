@@ -133,6 +133,8 @@ class DEFAULT_SETTINGS:
     threshold: int = 3
     instance_list: List[str] = ["vault-0", "vault-1", "vault-2"]
     namespace: str = "vault"
+    cluster_domain: str = "cluster.local"
+    port: int = 8200
 
 
 class VaultPolicy(BaseModel):
@@ -669,41 +671,35 @@ class Commands:
         except Exception as e:
             raise Exception(f"Error creating vault: {e}") from e
 
-    def unseal_instance(
-        self, keys: list = [], instance_name: str = "vault", namespace: str = "vault"
+    def unseal_instances(
+        self,
+        keys: list,
+        instance_list: list,
+        namespace: str,
+        cluster_domain: str,
+        service: str,
+        port: int,
     ) -> None:
-        """[TODO:description]
+        """Unseals multiple instances within a specified namespace using a set of provided keys.
+
+        Iterates through a list of instances and calls `unseal_instance` for each one.
 
         Args:
-            keys: [TODO:description]
-            instance_name: [TODO:description]
-            namespace: [TODO:description]
-        """
-        cluster_domain = "cluster.local"  # TODO: Move it to env
-        service = "vault-internal"
-        vault_port = 8200
-        for key in keys:
-            operator = f"vault operator unseal --address http://{instance_name}.{service}.{namespace}.svc.{cluster_domain}:{vault_port} {key}"
-            command = ["/bin/sh", "-c", f"{operator}"]
-            click.echo(f"Unseal instace: {instance_name} successfully!")
-            execute_command_in_pod(
-                pod_name=instance_name,
-                namespace=namespace,
-                command=command,
-            )
-
-    def unseal_all(
-        self, keys: list = [], instance_list: list = [], namespace: str = "vault"
-    ) -> None:
-        """[TODO:description]
-
-        Args:
-            keys: [TODO:description]
-            instance_list: [TODO:description]
-            namespace: [TODO:description]
+            keys: A list of keys required to unseal the instances.  If empty, defaults to using any available keys.
+            instance_list: A list of instance names to unseal.  Each name should correspond to an instance that exists within the specified namespace.
+            namespace: The namespace containing the instances to unseal. Defaults to "vault".
         """
         for instance in instance_list:
-            self.unseal_instance(keys=keys, instance_name=instance, namespace=namespace)
+            for key in keys:
+                operator = f"vault operator unseal --address http://{instance}.{service}.{namespace}.svc.{cluster_domain}:{port}"
+                command = ["/bin/sh", "-c", f"{operator} {key}"]
+                execute_command_in_pod(
+                    pod_name=instance,
+                    namespace=namespace,
+                    command=command,
+                )
+
+            click.echo(f"Unseal instace: {instance} successfully!")
 
     def sync_policy(self, policies: List, remove_orphans: bool = False):
         """Sync policies from configurations to Vault.
@@ -759,7 +755,6 @@ class Commands:
                         key="name", value=name, obj_list=policies, class_=VaultPolicy
                     ).rules
                     vault_policy_rules = self.client.policy_read(name=name)
-                    # WARNING: Compare logic maybe fail because policy string in Vault has been pretty formatting.
                     if config_policy_rules != vault_policy_rules:
                         self.client.policy_create_or_update(
                             name=name, policy=config_policy_rules
@@ -1187,6 +1182,24 @@ def cli(ctx: click.Context, config_path: str, **kwargs) -> None:
     show_default=True,
     help="Kubernetes namespace that install Vault.",
 )
+@click.option(
+    "--cluster_domain",
+    default=DEFAULT_SETTINGS.cluster_domain,
+    show_default=True,
+    help="Kubernetes cluster domain.",
+)
+@click.option(
+    "--service",
+    default=DEFAULT_SETTINGS.namespace,
+    show_default=True,
+    help="Kubernetes Vault service name.",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_SETTINGS.port,
+    show_default=True,
+    help="Kubernetes port that install Vault.",
+)
 def bootstrap(
     ctx: CLIContext,
     url: str,
@@ -1195,6 +1208,9 @@ def bootstrap(
     threshold: int,
     instance_list: Tuple,
     namespace: str,
+    cluster_domain: str,
+    service: str,
+    port: int,
 ) -> None:
     """
     Bootstrap the target Vault cluster
@@ -1205,7 +1221,6 @@ def bootstrap(
     After initializing, it will unseal the Vault cluster and apply the predefined configurations.
     """
     # Create raw Vault client
-    # client = VaultClient(url=url)
     commands = Commands(ctx.client)
     commands.create_vault(
         output_path=output_path,
@@ -1249,7 +1264,32 @@ def bootstrap(
     show_default=True,
     help="Kubernetes namespace that install Vault.",
 )
-def unseal(ctx: CLIContext, instance_list: Tuple, namespace: str) -> None:
+@click.option(
+    "--cluster_domain",
+    default=DEFAULT_SETTINGS.cluster_domain,
+    show_default=True,
+    help="Kubernetes cluster domain.",
+)
+@click.option(
+    "--service",
+    default=DEFAULT_SETTINGS.namespace,
+    show_default=True,
+    help="Kubernetes Vault service name.",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_SETTINGS.port,
+    show_default=True,
+    help="Kubernetes port that install Vault.",
+)
+def unseal(
+    ctx: CLIContext,
+    instance_list: Tuple,
+    namespace: str,
+    cluster_domain: str,
+    service: str,
+    port: int,
+) -> None:
     """
     Unseals Vault with unseal keys provide from command line.
 
@@ -1269,8 +1309,13 @@ def unseal(ctx: CLIContext, instance_list: Tuple, namespace: str) -> None:
         keys.append(key)
 
     commands = Commands(ctx.client)
-    commands.unseal_all(
-        keys=keys, namespace=namespace, instance_list=list(instance_list)
+    commands.unseal_instances(
+        keys=keys,
+        namespace=namespace,
+        instance_list=list(instance_list),
+        cluster_domain=cluster_domain,
+        service=service,
+        port=port,
     )
 
     click.echo("Unseal progress done. Let's take a coffee. :3")
