@@ -1,9 +1,11 @@
 import contextlib
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import click
+from click.exceptions import ClickException
 import hvac
 import hvac.exceptions as client_exception
 import requests
@@ -19,6 +21,69 @@ from pydantic import BaseModel
 JSONValue = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 JSONDict = Dict[str, JSONValue]
 T = TypeVar("T")
+
+###################
+#### Exception ####
+###################
+
+
+class VaultException(Exception):
+    pass
+
+
+class VaultAuthenticationError(VaultException):
+    pass
+
+
+class VaultSettingsError(VaultException):
+    pass
+
+
+class VaultConnectionError(VaultException):
+    message: str = "Error while connecting to Vault"
+
+
+# NOTE: Not used ?
+class VaultInitialized(VaultException):
+    message: str = "Vault is initialized"
+
+
+class VaultNotInitialized(VaultException):
+    message: str = "Vault is not initialized"
+
+
+class VaultAPIException(VaultException):
+    message: str = "Unexpected Vault error"
+
+    def __init__(self, errors: Optional[Iterable[str]] = None) -> None:
+        self.errors = errors
+
+    def __str__(self) -> str:
+        message = self.message
+        if self.errors:
+            message += "\n" + ("\n".join(self.errors))
+        return message
+
+
+class VaultInvalidRequest(VaultAPIException):
+    message: str = "Invalid request"
+
+
+class VaultUnauthorized(VaultAPIException):
+    message: str = "Missing authentication"
+
+
+class VaultInternalServerError(VaultAPIException):
+    message: str = "Vault server error"
+
+
+class VaultForbidden(VaultAPIException):
+    message = "Insufficient access for interacting with the requested secret"
+
+
+class VaultSealed(VaultAPIException):
+    message = "Vault sealed or down"
+
 
 ###################
 #### Utilities ####
@@ -56,6 +121,7 @@ def path_to_nested(dict_obj: Dict) -> Dict:
     return dict_obj
 
 
+# TODO: Handle exception for this function
 def execute_command_in_pod(pod_name, namespace, command):
     """
     Executes a command in a specified pod.
@@ -117,7 +183,18 @@ def get_obj_by_key_value_from_list(
             )
         if getattr(obj, key) == value:
             return obj
-    raise Exception(f"No object found with key '{key}' and value '{value}'")
+    raise ValueError(f"No object found with key '{key}' and value '{value}'")
+
+
+def extract_error_messages(exc: BaseException) -> Iterable[str]:
+    while True:
+        exc_str = str(exc).strip()
+        yield f"{type(exc).__name__}: {exc_str}"
+        opt_exc = exc.__cause__ or exc.__context__
+        if not opt_exc:
+            break
+
+        exc = opt_exc
 
 
 ########################
@@ -138,11 +215,11 @@ class DEFAULT_SETTINGS:
 
 
 class VaultPolicy(BaseModel):
-    """[TODO:description]
+    """Represents a policy for controlling access to Vault
 
     Attributes:
-        name: [TODO:attribute]
-        rules: [TODO:attribute]
+        name: The name of the policy. Must be unique
+        rules: A string containing the policy rules in Vault's policy language (HCL)
     """
 
     name: str
@@ -150,14 +227,18 @@ class VaultPolicy(BaseModel):
 
 
 class KubernetesAuthMethodConfigRole(BaseModel):
-    """[TODO:description]
+    """
+    Represents a configuration role for Kubernetes authentication in HashiCorp Vault.
 
     Attributes:
-        name: [TODO:attribute]
-        bound_service_account_names: [TODO:attribute]
-        bound_service_account_namespaces: [TODO:attribute]
-        policies: [TODO:attribute]
-        ttl: [TODO:attribute]
+        name (str): The name of the role to be configured.
+        bound_service_account_names (List[str]): A list of Kubernetes service account names
+            that are allowed to authenticate with this role.
+        bound_service_account_namespaces (List[str]): A list of Kubernetes namespaces containing
+            the service accounts that are bound to this role.
+        policies (List[str]): A list of Vault policies to be applied to tokens issued via this role.
+        ttl (str): The time-to-live (TTL) for tokens issued by this role. This is specified as a
+            duration string, e.g., "1h" or "30m".
     """
 
     name: str
@@ -213,6 +294,14 @@ class TokenAuthMethodConfig(BaseModel):
 
 
 class VaultAuthMethod(BaseModel):
+    """[TODO:description]
+
+    Attributes:
+        type: [TODO:attribute]
+        path: [TODO:attribute]
+        method_config: [TODO:attribute]
+    """
+
     type: str
     path: str
     method_config: Optional[
@@ -234,7 +323,16 @@ class VaultKVSecretEngine(BaseModel):
     type: str
 
 
-class StartupSecret(BaseModel):
+class SyncSecret(BaseModel):
+    """[TODO:description]
+
+    Attributes:
+        path: [TODO:attribute]
+        mount_point: [TODO:attribute]
+        type: [TODO:attribute]
+        data: [TODO:attribute]
+    """
+
     path: str
     mount_point: str
     type: str
@@ -242,74 +340,48 @@ class StartupSecret(BaseModel):
 
 
 class Configuration(BaseModel):
-    policies: List[VaultPolicy]
-    auth: List[VaultAuthMethod]
-    secret_engines: List[VaultKVSecretEngine]
-    startup_secrets: List[StartupSecret]
+    """Represents the overall configuration for Vault integration.
+
+    This class encapsulates various aspects of Vault setup, including policies, authentication methods,
+    secret engines, and startup secrets.  It serves as a central point for managing and accessing
+    all configuration parameters related to Vault interaction within the application.
+
+    Attributes:
+        policies (List[VaultPolicy]): A list of Vault policies defining access control rules.
+        auth (List[VaultAuthMethod]): A list of authentication methods configured for Vault.
+        secret_engines (List[VaultKVSecretEngine]): A list of configured Key-Value secret engines in Vault.
+        sync_secrets (List[SyncSecret]): A list of secrets that need to be retrieved during application startup.
+    """
+
+    policies: Optional[List[VaultPolicy]] = None
+    auth: Optional[List[VaultAuthMethod]] = None
+    secret_engines: Optional[List[VaultKVSecretEngine]] = None
+    sync_secrets: Optional[List[SyncSecret]] = None
 
 
 def load_config_file(config_path: str) -> Configuration:
+    """Loads configuration from a YAML file.
+
+    Args:
+        config_path (str): The path to the YAML configuration file.  The path will be expanded
+                        using `os.path.expanduser` to handle `~` for home directory.
+
+    Returns:
+        Configuration: A `Configuration` object populated with the data from the YAML file.
+                    Returns an empty `Configuration` object if the file is empty or contains no valid YAML data.
+
+    """
     try:
         with open(os.path.expanduser(config_path), "r") as f:
             config = yaml.safe_load(f) or {}
             return Configuration(**config)
     except FileNotFoundError:
-        raise click.ClickException(f"No config file at {config_path} (Skipping)")
+        raise click.ClickException(f"No config file at {config_path}.")
     except IOError:
         raise click.ClickException(
             f"Config file exists at {config_path}, but cannot be read. "
-            "Have you checked permission? (Skipping)"
+            "Have you checked permission?"
         )
-
-
-###################
-#### Exception ####
-###################
-
-
-class VaultException(Exception):
-    pass
-
-
-class VaultAuthenticationError(VaultException):
-    pass
-
-
-class VaultSettingsError(VaultException):
-    pass
-
-
-class VaultConnectionError(VaultException):
-    message: str = "Error while connecting to Vault"
-
-
-class VaultInitialized(VaultException):
-    message: str = "Vault is initialized"
-
-
-class VaultAPIException(VaultException):
-    message: str = "Unexpected Vault error"
-
-    def __init__(self, errors: Optional[Iterable[str]] = None) -> None:
-        self.errors = errors
-
-    def __str__(self) -> str:
-        message = self.message
-        if self.errors:
-            message += "\n" + ("\n".join(self.errors))
-        return message
-
-
-class VaultInvalidRequest(VaultAPIException):
-    message: str = "Invalid request"
-
-
-class VaultUnauthorized(VaultAPIException):
-    message: str = "Missing authentication"
-
-
-class VaultInternalServerError(VaultAPIException):
-    message: str = "Vault server error"
 
 
 ################
@@ -321,9 +393,20 @@ class VaultInternalServerError(VaultAPIException):
 def handle_client_errors():
     try:
         yield
+    except client_exception.InvalidRequest as exc:
+        raise VaultInvalidRequest(errors=exc.errors) from exc
+    except client_exception.Unauthorized as exc:
+        raise VaultUnauthorized(errors=exc.errors) from exc
+    except client_exception.Forbidden as exc:
+        raise VaultForbidden(errors=exc.errors) from exc
+    except client_exception.InternalServerError as exc:
+        raise VaultInternalServerError(errors=exc.errors) from exc
+    except client_exception.VaultDown as exc:
+        raise VaultSealed(errors=exc.errors) from exc
     except client_exception.UnexpectedError as exc:
         raise VaultAPIException(errors=exc.errors) from exc
-    # TODO: Add handle not authentication exception
+    except client_exception.VaultNotInitialized as exc:
+        raise VaultNotInitialized() from exc
     except requests.exceptions.ConnectionError as exc:
         raise VaultConnectionError() from exc
 
@@ -701,7 +784,9 @@ class Commands:
 
             click.echo(f"Unseal instace: {instance} successfully!")
 
-    def sync_policy(self, policies: List, remove_orphans: bool = False):
+    def sync_policy(
+        self, policies: Optional[List] = None, remove_orphans: bool = False
+    ):
         """Sync policies from configurations to Vault.
 
         Args:
@@ -712,6 +797,11 @@ class Commands:
             A list of strings representing any errors encountered during the sync process.  Returns an empty list if successful.
         """
         errors = []
+        # Check if policies configurations exists
+        if not policies:
+            return errors
+
+        # Sync policies configurations
         try:
             # Get Policies from Vault
             exclude_policies = ["root", "default"]
@@ -782,8 +872,15 @@ class Commands:
 
         return errors
 
-    def sync_authmethods(self, authmethods: List, remove_orphans: bool = False) -> List:
+    def sync_authmethods(
+        self, authmethods: Optional[List] = None, remove_orphans: bool = False
+    ) -> List:
         errors = []
+        # Check if Authentication methods configurations exists
+        if not authmethods:
+            return errors
+
+        # Sync authenticate methods configurations
         try:
             # Get Authentication methods from Vault
             vault_authmethods = [
@@ -1039,9 +1136,15 @@ class Commands:
         pass
 
     def sync_kvv2_secretengines(
-        self, secrets_engines: List[VaultKVSecretEngine], remove_orphans: bool = False
+        self,
+        secrets_engines: Optional[List[VaultKVSecretEngine]] = None,
+        remove_orphans: bool = False,
     ) -> List:
         errors = []
+
+        if not secrets_engines:
+            return errors
+
         try:
             # Get list kvv2 secrets engines mount and exclude default mounts
             mounts_vault = set(
@@ -1084,10 +1187,15 @@ class Commands:
 
         return errors
 
-    def sync_secrets(self, startup_secrets: List, remove_orphans: bool = False) -> List:
+    def sync_secrets(
+        self, sync_secrets: Optional[List] = None, remove_orphans: bool = False
+    ) -> List:
         errors = []
+        if not sync_secrets:
+            return errors
+
         try:
-            for secret in startup_secrets:
+            for secret in sync_secrets:
                 self.client.kvv2_secrets_create_or_update(
                     path=secret.path, mount_point=secret.mount_point, secret=secret.data
                 )
@@ -1096,6 +1204,14 @@ class Commands:
             errors.append(f"An unexpected error occurred: {exc}")
 
         return errors
+
+
+@contextlib.contextmanager
+def handle_errors():
+    try:
+        yield
+    except VaultException as exc:
+        raise click.ClickException("\n".join(extract_error_messages(exc)))
 
 
 CONTEXT_SETTINGS = {
@@ -1122,6 +1238,13 @@ class CLIContext:
     show_default=True,
 )
 @click.option(
+    "--url",
+    "-u",
+    default=DEFAULT_SETTINGS.url,
+    show_default=True,
+    help="URL of the Vault instance.",
+)
+@click.option(
     "-V",
     "--version",
     is_flag=True,
@@ -1129,7 +1252,8 @@ class CLIContext:
     expose_value=False,
     is_eager=True,
 )
-def cli(ctx: click.Context, config_path: str, **kwargs) -> None:
+@handle_errors()
+def cli(ctx: click.Context, config_path: str, url: str) -> None:
     """
     Interact with a Vault. See subcommands for details.
 
@@ -1138,7 +1262,7 @@ def cli(ctx: click.Context, config_path: str, **kwargs) -> None:
 
     """
     ctx.ensure_object(dict)
-    ctx.obj = CLIContext(VaultClient(**kwargs), load_config_file(config_path))
+    ctx.obj = CLIContext(VaultClient(url=url), load_config_file(config_path))
 
 
 @cli.command()
@@ -1200,6 +1324,7 @@ def cli(ctx: click.Context, config_path: str, **kwargs) -> None:
     show_default=True,
     help="Kubernetes port that install Vault.",
 )
+@handle_errors()
 def bootstrap(
     ctx: CLIContext,
     url: str,
@@ -1222,24 +1347,26 @@ def bootstrap(
     """
     # Create raw Vault client
     commands = Commands(ctx.client)
-    commands.create_vault(
+
+    # Check Vault initialized
+    initialized = ctx.client.is_initialized()
+    if initialized:
+        click.echo("Your Vault is initialized, do your next action.")
+        return
+
+    # Initialize Vault
+    keys, root_token = commands.create_vault(
         output_path=output_path,
         key_shares=key_shares,
         threshold=threshold,
     )
 
-    # Check Vault connection
-    # client.init_status()
-    click.echo("Ping ok!")
+    # Wait for Cluster initialized
+    time.sleep(10)
 
-    # Validate configurations
-    # NOTE: Check vault init status before init ?
+    # Unseal Vault
+    commands.unseal_instances(keys=keys, namespace=nam)
 
-    # Initialize Vault
-
-    # NOTE: Check when vault cluster is initialize OK
-    # time.sleep(10)
-    #
     # client.token = result["root_token"]
     # client.auth()
 
@@ -1282,6 +1409,7 @@ def bootstrap(
     show_default=True,
     help="Kubernetes port that install Vault.",
 )
+@handle_errors()
 def unseal(
     ctx: CLIContext,
     instance_list: Tuple,
@@ -1333,7 +1461,7 @@ def unseal(
 )
 @click.option(
     "--username",
-    "-u",
+    "-U",
     prompt=True,
     prompt_required=False,
     envvar="VAULT_CLI_USERNAME",
@@ -1356,6 +1484,7 @@ def unseal(
     default=False,
     show_default=True,
 )
+@handle_errors()
 def sync_configs(
     ctx: CLIContext, token: str, username: str, password: str, remove_orphans: bool
 ):
@@ -1372,10 +1501,12 @@ def sync_configs(
     )
     errors = []
     commands = Commands(ctx.client)
-    errors = errors + commands.sync_policy(ctx.cfg.policies, remove_orphans)
-    errors = errors + commands.sync_authmethods(ctx.cfg.auth, remove_orphans)
-    errors = errors + commands.sync_kvv2_secretengines(
-        ctx.cfg.secret_engines, remove_orphans
+
+    # Sync Vault configurations
+    errors.extend(commands.sync_policy(ctx.cfg.policies, remove_orphans))
+    errors.extend(commands.sync_authmethods(ctx.cfg.auth, remove_orphans))
+    errors.extend(
+        commands.sync_kvv2_secretengines(ctx.cfg.secret_engines, remove_orphans)
     )
 
     if errors:
@@ -1420,6 +1551,7 @@ def sync_configs(
     default=False,
     show_default=True,
 )
+@handle_errors()
 def sync_secrets(
     ctx: CLIContext, token: str, username: str, password: str, remove_orphans: bool
 ):
@@ -1435,7 +1567,7 @@ def sync_secrets(
         password=password,
     )
     commands = Commands(ctx.client)
-    errors = commands.sync_secrets(ctx.cfg.startup_secrets, remove_orphans)
+    errors = commands.sync_secrets(ctx.cfg.sync_secrets, remove_orphans)
 
     if errors:
         for err in errors:
