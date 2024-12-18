@@ -5,11 +5,11 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import click
-from click.exceptions import ClickException
 import hvac
 import hvac.exceptions as client_exception
 import requests
 import yaml
+from click.exceptions import ClickException
 from kubernetes import client, config
 from kubernetes.stream import stream
 from pydantic import BaseModel
@@ -122,7 +122,7 @@ def path_to_nested(dict_obj: Dict) -> Dict:
 
 
 # TODO: Handle exception for this function
-def execute_command_in_pod(pod_name, namespace, command):
+def execute_command_in_pod(pod_name: str, namespace: str, command: List[str]):
     """
     Executes a command in a specified pod.
 
@@ -148,8 +148,8 @@ def execute_command_in_pod(pod_name, namespace, command):
     while resp.is_open():
         resp.update(timeout=1)
 
-        if resp.peek_stdout():
-            click.echo(f"STDOUT: {resp.read_stdout()}")
+        # if resp.peek_stdout():
+        #     click.echo(f"STDOUT: {resp.read_stdout()}")
 
         if resp.peek_stderr():
             click.echo(f"STDERR: {resp.read_stderr()}")
@@ -773,6 +773,7 @@ class Commands:
             namespace: The namespace containing the instances to unseal. Defaults to "vault".
         """
         for instance in instance_list:
+            count = 1
             for key in keys:
                 operator = f"vault operator unseal --address http://{instance}.{service}.{namespace}.svc.{cluster_domain}:{port}"
                 command = ["/bin/sh", "-c", f"{operator} {key}"]
@@ -781,8 +782,13 @@ class Commands:
                     namespace=namespace,
                     command=command,
                 )
+                click.echo(f"Unseal instance: {instance} - {count}/{len(keys)}")
 
             click.echo(f"Unseal instace: {instance} successfully!")
+
+    def check_seal(self) -> bool:
+        """Check Vault is sealed or not"""
+        return self.client.is_sealed()
 
     def sync_policy(
         self, policies: Optional[List] = None, remove_orphans: bool = False
@@ -1135,6 +1141,7 @@ class Commands:
     def _sync_token_authmethod_config(self, config: TokenAuthMethodConfig):
         pass
 
+    # FIX: Sync secrets engines always show orphans
     def sync_kvv2_secretengines(
         self,
         secrets_engines: Optional[List[VaultKVSecretEngine]] = None,
@@ -1206,6 +1213,7 @@ class Commands:
         return errors
 
 
+# TODO: Optimize this
 @contextlib.contextmanager
 def handle_errors():
     try:
@@ -1268,13 +1276,6 @@ def cli(ctx: click.Context, config_path: str, url: str) -> None:
 @cli.command()
 @click.pass_obj
 @click.option(
-    "--url",
-    "-u",
-    default=DEFAULT_SETTINGS.url,
-    show_default=True,
-    help="URL of the Vault instance.",
-)
-@click.option(
     "--output_path",
     "-o",
     default=DEFAULT_SETTINGS.output_path,
@@ -1327,7 +1328,6 @@ def cli(ctx: click.Context, config_path: str, url: str) -> None:
 @handle_errors()
 def bootstrap(
     ctx: CLIContext,
-    url: str,
     output_path: str,
     key_shares: int,
     threshold: int,
@@ -1349,31 +1349,57 @@ def bootstrap(
     commands = Commands(ctx.client)
 
     # Check Vault initialized
+    click.echo("Checking Vault...")
     initialized = ctx.client.is_initialized()
     if initialized:
         click.echo("Your Vault is initialized, do your next action.")
         return
 
     # Initialize Vault
+    click.echo("Vault initializing...")
     keys, root_token = commands.create_vault(
         output_path=output_path,
         key_shares=key_shares,
         threshold=threshold,
     )
+    click.echo("Vault initialized.")
 
     # Wait for Cluster initialized
     time.sleep(10)
 
     # Unseal Vault
-    commands.unseal_instances(keys=keys, namespace=nam)
+    click.echo("Vault unsealing...")
+    while commands.check_seal():
+        commands.unseal_instances(
+            keys=keys,
+            instance_list=list(instance_list),
+            namespace=namespace,
+            cluster_domain=cluster_domain,
+            service=service,
+            port=port,
+        )
+    click.echo("Vault unsealed.")
 
-    # client.token = result["root_token"]
-    # client.auth()
+    # Authenticate with Vault
+    ctx.client.auth(token=root_token)
 
-    # Verify Vault status
-    # Check vault seal status before unseal
+    errors = []
     # Apply predefined configurations
-    # Create startup secrets
+    click.echo("Vault configurations syncing...")
+    errors.extend(commands.sync_policy(ctx.cfg.policies))
+    errors.extend(commands.sync_authmethods(ctx.cfg.auth))
+    errors.extend(commands.sync_kvv2_secretengines(ctx.cfg.secret_engines))
+    click.echo("Vault configurations synced.")
+    # Sync secrets
+    click.echo("Vault secrets syncing.")
+    errors.extend(commands.sync_secrets(ctx.cfg.sync_secrets))
+    click.echo("Vault secrets synced.")
+
+    if errors:
+        for err in errors:
+            click.echo(err)
+    else:
+        click.echo("Your vault is ready. Let's go! :D")
 
 
 @cli.command()
@@ -1528,7 +1554,7 @@ def sync_configs(
 )
 @click.option(
     "--username",
-    "-u",
+    "-U",
     prompt=True,
     prompt_required=False,
     envvar="VAULT_CLI_USERNAME",
