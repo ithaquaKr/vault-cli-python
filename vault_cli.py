@@ -2,14 +2,13 @@ import contextlib
 import json
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
 import click
 import hvac
 import hvac.exceptions as client_exception
 import requests
 import yaml
-from click.exceptions import ClickException
 from kubernetes import client, config
 from kubernetes.stream import stream
 from pydantic import BaseModel
@@ -463,7 +462,7 @@ class VaultClient:
     @handle_client_errors()
     def auth_methods_list(self) -> JSONDict:
         """List all enabled auth methods."""
-        return self.client.sys.list_auth_methods().get("data") or {}
+        return self.client.sys.list_auth_methods().get("data", {})
 
     @handle_client_errors()
     def auth_method_enable(self, method_type: str, path: str) -> JSONDict:
@@ -496,10 +495,21 @@ class VaultClient:
     @handle_client_errors()
     def kubernetes_auth_method_list_role(self, mount_point: str) -> List:
         """List all the roles that are registered with the plugin."""
-        return (
-            self.client.auth.kubernetes.list_roles(mount_point=mount_point).get("keys")
-            or []
-        )
+        # This behavior might be a bug or an undefined behavior in the Vault Client.
+        # When attempting to list roles on an empty mount_point (no roles exist),
+        # the client raises an InvalidPath exception.
+        # This causes errors in subsequent operations, such as creating new roles
+        # or updating existing roles based on the current list of roles.
+        #
+        # Workaround:
+        # We catch the InvalidPath exception and return an empty list.
+        # This ensures that subsequent steps for role creation or updates
+        # can proceed without issues.
+        try:
+            roles = self.client.auth.kubernetes.list_roles(mount_point=mount_point)
+        except client_exception.InvalidPath:
+            return []
+        return roles.get("keys", [])
 
     @handle_client_errors()
     def kubernetes_auth_method_read_role(self, mount_point: str, name: str) -> JSONDict:
@@ -569,10 +579,14 @@ class VaultClient:
     @handle_client_errors()
     def userpass_auth_method_list_user(self, mount_point: str) -> List[str]:
         """List existing users that have been created in the auth method."""
-        return (
-            self.client.auth.userpass.list_user(mount_point=mount_point)["data"]["keys"]
-            or []
-        )
+        # Similar as Kubernetes authenticate methods, it will raise exception
+        # when list to empty mount_point
+        try:
+            users = self.client.auth.userpass.list_user(mount_point=mount_point)
+        except client_exception.InvalidPath:
+            return []
+
+        return users["data"]["keys"]
 
     @handle_client_errors()
     def userpass_auth_method_read_user(
@@ -783,6 +797,7 @@ class Commands:
                     command=command,
                 )
                 click.echo(f"Unseal instance: {instance} - {count}/{len(keys)}")
+                count += 1
 
             click.echo(f"Unseal instace: {instance} successfully!")
 
@@ -891,7 +906,7 @@ class Commands:
             # Get Authentication methods from Vault
             vault_authmethods = [
                 {"path": path, "type": details["type"]}
-                for path, details in self.client.auth_methods_list().items()  # BUG: Fail when empty auth method list
+                for path, details in self.client.auth_methods_list().items()
                 if isinstance(details, dict) and "type" in details
             ]
 
@@ -1047,8 +1062,10 @@ class Commands:
                     "\nYou can run 'sync_config --remove_orphans' to delete them."
                 )
 
-        except Exception as exc:
-            errors.append(f"An unexpected error occurred: {exc}")
+        except VaultException as exc:
+            errors.append(
+                f"An unexpected error occurred when sync kubernetes authentication method: {exc}"
+            )
 
     def _sync_userpass_authmethod_config(
         self,
@@ -1134,14 +1151,14 @@ class Commands:
                     "\nYou can run 'sync_config --remove_orphans' to delete them."
                 )
 
-        except Exception as exc:
+        except VaultException as exc:
             errors.append(f"An unexpected error occurred: {exc}")
 
     # TODO: Implement this
     def _sync_token_authmethod_config(self, config: TokenAuthMethodConfig):
         pass
 
-    # FIX: Sync secrets engines always show orphans
+    # BUG: Sync secrets engines always show orphans
     def sync_kvv2_secretengines(
         self,
         secrets_engines: Optional[List[VaultKVSecretEngine]] = None,
@@ -1371,7 +1388,9 @@ def bootstrap(
     click.echo("Vault unsealing...")
     while commands.check_seal():
         commands.unseal_instances(
-            keys=keys,
+            keys=keys[
+                : (key_shares - threshold)
+            ],  # We only need "threshold" number of key to unseal
             instance_list=list(instance_list),
             namespace=namespace,
             cluster_domain=cluster_domain,
