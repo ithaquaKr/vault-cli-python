@@ -42,7 +42,6 @@ class VaultConnectionError(VaultException):
     message: str = "Error while connecting to Vault"
 
 
-# NOTE: Not used ?
 class VaultInitialized(VaultException):
     message: str = "Vault is initialized"
 
@@ -89,39 +88,11 @@ class VaultSealed(VaultAPIException):
 ###################
 
 
-def path_to_nested(dict_obj: Dict) -> Dict:
-    """
-    Transform a dict with paths as keys into a nested
-    dict
-    >>> path_to_nested ({"a/b/c": "d", "a/e": "f"})
-    {"a": {"b": {"c": "d"}, "e": "f"}}
-
-    If 2 unconsistent values are detected, fails with ValueError:
-    >>> path_to_nested ({"a/b/c": "d", "a/b": "e"})
-    ValueError()
-    """
-
-    for path in list(dict_obj):
-        working_dict = dict_obj
-
-        value = dict_obj.pop(path)
-
-        *folders, subpath = path.strip("/").split("/")
-
-        for folder in folders:
-            sub_dict = working_dict.setdefault(folder, {})
-            if not isinstance(sub_dict, dict):
-                raise ValueError("Inconsistent values detected")
-            working_dict = sub_dict
-
-        if subpath in working_dict:
-            raise ValueError("Inconsistent values detected")
-        working_dict[subpath] = value
-    return dict_obj
-
-
-# TODO: Handle exception for this function
-def execute_command_in_pod(pod_name: str, namespace: str, command: List[str]):
+def execute_command_in_pod(
+    pod_name: str,
+    namespace: str,
+    command: List[str],
+):
     """
     Executes a command in a specified pod.
 
@@ -146,10 +117,8 @@ def execute_command_in_pod(pod_name: str, namespace: str, command: List[str]):
     )
     while resp.is_open():
         resp.update(timeout=1)
-
-        # if resp.peek_stdout():
-        #     click.echo(f"STDOUT: {resp.read_stdout()}")
-
+        if resp.peek_stdout():
+            click.echo(f"STDOUT: {resp.read_stdout()}")
         if resp.peek_stderr():
             click.echo(f"STDERR: {resp.read_stderr()}")
 
@@ -209,7 +178,6 @@ class DEFAULT_SETTINGS:
     threshold: int = 3
     instance_list: List[str] = ["vault-0", "vault-1", "vault-2"]
     namespace: str = "vault"
-    cluster_domain: str = "cluster.local"
     port: int = 8200
 
 
@@ -248,13 +216,22 @@ class KubernetesAuthMethodConfigRole(BaseModel):
 
 
 class KubernetesAuthMethodConfig(BaseModel):
-    """[TODO:description]
+    """Configuration for Kubernetes authentication method in Vault.
+
+    This class represents the configuration settings required to set up and manage
+    Kubernetes authentication in HashiCorp Vault. It includes necessary credentials
+    and connection details for Vault to authenticate against a Kubernetes cluster.
 
     Attributes:
-        token_reviewer_jwt: [TODO:attribute]
-        kubernetes_ca_cert: [TODO:attribute]
-        kubernetes_host: [TODO:attribute]
-        roles: [TODO:attribute]
+        token_reviewer_jwt: Optional JWT token used by Vault to validate Kubernetes
+            service account tokens. This token must have permissions to access the
+            TokenReview API in the Kubernetes cluster.
+        kubernetes_ca_cert: Optional PEM encoded CA certificate for the Kubernetes
+            cluster. Used by Vault to verify the Kubernetes API server's TLS certificate.
+        kubernetes_host: URL of the Kubernetes API server that Vault will connect to
+            for authenticating service accounts (e.g., 'https://kubernetes.default.svc').
+        roles: List of Kubernetes authentication roles configuration that map Kubernetes
+            Service Accounts to Vault policies and tokens.
     """
 
     token_reviewer_jwt: Optional[str] = None
@@ -264,12 +241,17 @@ class KubernetesAuthMethodConfig(BaseModel):
 
 
 class UserpassAuthMethodConfigUsers(BaseModel):
-    """[TODO:description]
+    """Configuration for individual users in Vault's Userpass authentication method.
+
+    This class defines the credentials and permissions for users that can authenticate
+    to Vault using username and password authentication.
 
     Attributes:
-        username: [TODO:attribute]
-        password: [TODO:attribute]
-        token_policies: [TODO:attribute]
+        username: The username that will be used for authentication to Vault.
+        password: The password associated with the username for authentication.
+        token_policies: List of Vault policies to be attached to tokens generated
+            upon successful authentication of this user. These policies define the
+            permissions the user will have in Vault.
     """
 
     username: str
@@ -278,10 +260,15 @@ class UserpassAuthMethodConfigUsers(BaseModel):
 
 
 class UserpassAuthMethodConfig(BaseModel):
-    """[TODO:description]
+    """Configuration for Userpass authentication method in Vault.
+
+    This class represents the configuration for username/password authentication
+    method in HashiCorp Vault. It allows setting up multiple users with their
+    respective credentials and access policies.
 
     Attributes:
-        users: [TODO:attribute]
+        users: List of user configurations, where each user entry contains
+            their username, password, and associated token policies.
     """
 
     users: List[UserpassAuthMethodConfigUsers]
@@ -293,12 +280,25 @@ class TokenAuthMethodConfig(BaseModel):
 
 
 class VaultAuthMethod(BaseModel):
-    """[TODO:description]
+    """Configuration for authentication methods in HashiCorp Vault.
+
+    This class represents the configuration of an authentication method in Vault,
+    defining how users or systems can authenticate to access Vault services.
+    It supports multiple authentication types including Userpass, Token, and Kubernetes.
 
     Attributes:
-        type: [TODO:attribute]
-        path: [TODO:attribute]
-        method_config: [TODO:attribute]
+        type: The type of authentication method to enable in Vault. Common values include
+            'kubernetes', 'userpass', 'token', etc. This determines how credentials are
+            validated.
+        path: The path where the auth method will be mounted in Vault. For example,
+            'kubernetes' for Kubernetes auth or 'userpass' for username/password auth.
+            This path will be used in the Vault API URL: auth/<path>.
+        method_config: Specific configuration for the chosen authentication method.
+            Can be one of:
+            - UserpassAuthMethodConfig for username/password authentication
+            - TokenAuthMethodConfig for token-based authentication
+            - KubernetesAuthMethodConfig for Kubernetes service account authentication
+            If None, the auth method will be enabled with default settings.
     """
 
     type: str
@@ -311,11 +311,20 @@ class VaultAuthMethod(BaseModel):
 
 
 class VaultKVSecretEngine(BaseModel):
-    """[TODO:description]
+    """Configuration for Key-Value secret engine in Vault.
+
+    This class defines the configuration for mounting and managing a Key-Value (KV)
+    secrets engine in Vault. The KV secrets engine is used to store arbitrary secrets
+    within the configured physical storage for Vault.
 
     Attributes:
-        path: [TODO:attribute]
-        type: [TODO:attribute]
+        path: The path where the KV secrets engine will be mounted in Vault.
+            For example, 'secret' or 'kv'. This path will be used to access
+            secrets through the Vault API: <path>/data/...
+        type: The type of the secrets engine. Should be either 'kv' or 'kv-v2'
+            depending on the desired version of the KV secrets engine.
+            - 'kv' is version 1 (no versioning)
+            - 'kv-v2' is version 2 (includes versioning)
     """
 
     path: str
@@ -323,13 +332,28 @@ class VaultKVSecretEngine(BaseModel):
 
 
 class SyncSecret(BaseModel):
-    """[TODO:description]
+    """Configuration for synchronizing secrets into Vault.
+
+    This class represents the configuration needed to create or update secrets
+    in Vault's Key-Value store. It defines where and how secrets should be stored,
+    including their location and content.
 
     Attributes:
-        path: [TODO:attribute]
-        mount_point: [TODO:attribute]
-        type: [TODO:attribute]
-        data: [TODO:attribute]
+        path: The path where the secret will be stored in Vault, relative to the
+            mount point. For example, if you want to store a secret at
+            'secret/myapp/credentials', the path would be 'myapp/credentials'.
+        mount_point: The mount point of the secrets engine where the secret will
+            be stored. This should match the 'path' configured in VaultKVSecretEngine.
+            For example, 'secret' or 'kv'.
+        type: The type of secret being stored. This should match the type of the
+            secrets engine being used (e.g., 'kv' or 'kv-v2').
+        data: A dictionary containing the secret data to be stored. Each key-value
+            pair in this dictionary represents a field in the secret. For example:
+            {
+                "username": "admin",
+                "password": "secret123",
+                "api_key": "abcd1234"
+            }
     """
 
     path: str
@@ -458,6 +482,11 @@ class VaultClient:
     def initialize(self, shares: int, threshold: int) -> JSONDict:
         """Initialize a new Vault."""
         return self.client.sys.initialize(shares, threshold)
+
+    @handle_client_errors()
+    def unseal_keys(self, keys) -> JSONDict:
+        """Enter multiple master keys share to progress the unsealing of Vault"""
+        return self.client.sys.submit_unseal_keys(keys=keys)
 
     @handle_client_errors()
     def auth_methods_list(self) -> JSONDict:
@@ -657,43 +686,6 @@ class VaultClient:
     def kvv2_secrets_engines_disable(self, path: str) -> JSONDict:
         return self.client.sys.disable_secrets_engine(path=path)
 
-    # @handle_client_errors()
-    # def secrets_engines_read_config(self, path: str) -> JSONDict:
-    #     return self.client.sys.read_mount_configuration(path=path)
-    #
-    # @handle_client_errors()
-    # def secrets_engines_tune_configs(self) -> JSONDict:
-    #     return {}
-
-    def _browse_recursive_secrets(self, path: str, mount_point: str) -> Iterable[str]:
-        """
-        Given a secret or folder path, return the path of all secrets
-        under it (or the path itself)
-        """
-        # 4 things can happen:
-        # - path is "", it's the root (and a folder)
-        # - path ends with /, we know it's a folder
-        # - path doesn't end with a / and yet it's a folder
-        # - path is a secret
-        folder = path.endswith("/") or path == ""
-
-        sub_secrets = self.kvv2_secrets_list(path=path, mount_point=mount_point)
-
-        if not folder and not sub_secrets:
-            # It's most probably a secret
-            yield path
-
-        for key in sub_secrets:
-            folder = key.endswith("/")
-            key = key.rstrip("/")
-            key_url = f"{path}/{key}" if path else key
-            if not folder:
-                yield key_url
-                continue
-
-            for sub_path in self._browse_recursive_secrets(key_url, mount_point):
-                yield sub_path
-
     @handle_client_errors()
     def kvv2_secrets_list(self, path: str, mount_point: str) -> List:
         return (
@@ -751,8 +743,6 @@ class Commands:
         Raises:
             Exception: If there is an error creating the vault.
         """
-        if self.client.is_initialized():
-            return [], ""  # Return early if already initialized
 
         try:
             result: Dict[str, Any] = self.client.initialize(key_shares, threshold)
@@ -773,8 +763,6 @@ class Commands:
         keys: list,
         instance_list: list,
         namespace: str,
-        cluster_domain: str,
-        service: str,
         port: int,
     ) -> None:
         """Unseals multiple instances within a specified namespace using a set of provided keys.
@@ -786,10 +774,21 @@ class Commands:
             instance_list: A list of instance names to unseal.  Each name should correspond to an instance that exists within the specified namespace.
             namespace: The namespace containing the instances to unseal. Defaults to "vault".
         """
+
+        # The unseal process for Vault must be performed on the leader node –
+        # the node that initialized Vault first. After that, the other nodes
+        # can proceed to unseal Vault.”
+        click.echo("Unsealing the leader node...")
+        self.client.unseal_keys(keys=keys)
+        click.echo("Leader is unseal successfully!")
+
+        # Note: Unsealing a node that is already unsealed is allowed and will not cause issues.
+        # Currently, there is no implemented logic to handle this duplicate operation.
+        # Contributions and suggestions to improve this are welcome!
         for instance in instance_list:
             count = 1
             for key in keys:
-                operator = f"vault operator unseal --address http://{instance}.{service}.{namespace}.svc.{cluster_domain}:{port}"
+                operator = f"vault operator unseal --address http://{instance}:{port}"
                 command = ["/bin/sh", "-c", f"{operator} {key}"]
                 execute_command_in_pod(
                     pod_name=instance,
@@ -798,12 +797,9 @@ class Commands:
                 )
                 click.echo(f"Unseal instance: {instance} - {count}/{len(keys)}")
                 count += 1
+                time.sleep(2)  # Sleep between each time unseal
 
             click.echo(f"Unseal instace: {instance} successfully!")
-
-    def check_seal(self) -> bool:
-        """Check Vault is sealed or not"""
-        return self.client.is_sealed()
 
     def sync_policy(
         self, policies: Optional[List] = None, remove_orphans: bool = False
@@ -1158,7 +1154,6 @@ class Commands:
     def _sync_token_authmethod_config(self, config: TokenAuthMethodConfig):
         pass
 
-    # BUG: Sync secrets engines always show orphans
     def sync_kvv2_secretengines(
         self,
         secrets_engines: Optional[List[VaultKVSecretEngine]] = None,
@@ -1230,7 +1225,6 @@ class Commands:
         return errors
 
 
-# TODO: Optimize this
 @contextlib.contextmanager
 def handle_errors():
     try:
@@ -1325,18 +1319,6 @@ def cli(ctx: click.Context, config_path: str, url: str) -> None:
     help="Kubernetes namespace that install Vault.",
 )
 @click.option(
-    "--cluster_domain",
-    default=DEFAULT_SETTINGS.cluster_domain,
-    show_default=True,
-    help="Kubernetes cluster domain.",
-)
-@click.option(
-    "--service",
-    default=DEFAULT_SETTINGS.namespace,
-    show_default=True,
-    help="Kubernetes Vault service name.",
-)
-@click.option(
     "--port",
     default=DEFAULT_SETTINGS.port,
     show_default=True,
@@ -1350,8 +1332,6 @@ def bootstrap(
     threshold: int,
     instance_list: Tuple,
     namespace: str,
-    cluster_domain: str,
-    service: str,
     port: int,
 ) -> None:
     """
@@ -1386,18 +1366,12 @@ def bootstrap(
 
     # Unseal Vault
     click.echo("Vault unsealing...")
-    while commands.check_seal():
-        commands.unseal_instances(
-            keys=keys[
-                : (key_shares - threshold)
-            ],  # We only need "threshold" number of key to unseal
-            instance_list=list(instance_list),
-            namespace=namespace,
-            cluster_domain=cluster_domain,
-            service=service,
-            port=port,
-        )
-    click.echo("Vault unsealed.")
+    commands.unseal_instances(
+        keys=keys[:threshold],  # We only need "threshold" number of key to unseal
+        instance_list=list(instance_list),
+        namespace=namespace,
+        port=port,
+    )
 
     # Authenticate with Vault
     ctx.client.auth(token=root_token)
@@ -1437,18 +1411,6 @@ def bootstrap(
     help="Kubernetes namespace that install Vault.",
 )
 @click.option(
-    "--cluster_domain",
-    default=DEFAULT_SETTINGS.cluster_domain,
-    show_default=True,
-    help="Kubernetes cluster domain.",
-)
-@click.option(
-    "--service",
-    default=DEFAULT_SETTINGS.namespace,
-    show_default=True,
-    help="Kubernetes Vault service name.",
-)
-@click.option(
     "--port",
     default=DEFAULT_SETTINGS.port,
     show_default=True,
@@ -1459,8 +1421,6 @@ def unseal(
     ctx: CLIContext,
     instance_list: Tuple,
     namespace: str,
-    cluster_domain: str,
-    service: str,
     port: int,
 ) -> None:
     """
@@ -1482,12 +1442,11 @@ def unseal(
         keys.append(key)
 
     commands = Commands(ctx.client)
+    click.echo("Vault unsealing...")
     commands.unseal_instances(
         keys=keys,
         namespace=namespace,
         instance_list=list(instance_list),
-        cluster_domain=cluster_domain,
-        service=service,
         port=port,
     )
 
